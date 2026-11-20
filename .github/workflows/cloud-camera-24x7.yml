@@ -1,0 +1,103 @@
+name: MagicSecurity 24/7 Cloud Bridge (Mac-Off Autonomous Relay)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/20 * * * *'
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: magicsecurity-cloud-24x7
+  cancel-in-progress: false
+
+jobs:
+  cloud-relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install ffmpeg and cloudflared
+        run: |
+          sudo apt-get update -yq
+          sudo apt-get install -yq ffmpeg curl jq
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
+          chmod +x /usr/local/bin/cloudflared
+
+      - name: Run 24/7 Cloud Camera Bridge & Self-Renew
+        env:
+          CAMERA_PUBLIC_IP: ${{ secrets.CAMERA_PUBLIC_IP }}
+          CAMERA_RTSP_PORT: ${{ secrets.CAMERA_RTSP_PORT }}
+          CAMERA_ONVIF_PORT: ${{ secrets.CAMERA_ONVIF_PORT }}
+          CAMERA_USER: ${{ secrets.CAMERA_USER }}
+          CAMERA_PASS: ${{ secrets.CAMERA_PASS }}
+          MOBILE_TOKEN: ${{ secrets.MOBILE_TOKEN }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 cloud_bridge.py &
+          BRIDGE_PID=$!
+          sleep 2
+
+          cloudflared tunnel --no-autoupdate --url http://127.0.0.1:11988 > /tmp/cf.log 2>&1 &
+          CF_PID=$!
+
+          CLOUD_URL=""
+          for i in $(seq 1 30); do
+            CLOUD_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cf.log | head -n 1 || true)
+            if [ -n "$CLOUD_URL" ]; then break; fi
+            sleep 1
+          done
+
+          echo "Cloud Tunnel active: $CLOUD_URL"
+
+          publish_state() {
+            git pull --rebase origin main || true
+            MAC_TUN=$(jq -r '.macTunnel // ""' tunnel.json 2>/dev/null || echo "")
+            TS=$(date +%s)
+            jq -n \
+              --arg tun "${MAC_TUN:-$CLOUD_URL}" \
+              --arg mac "$MAC_TUN" \
+              --arg cloud "$CLOUD_URL" \
+              --arg ch "$CHANNEL_ID" \
+              --arg tok "$MOBILE_TOKEN" \
+              --argjson ts "$TS" \
+              '{tunnel: (if $mac != "" then $mac else $cloud end), macTunnel: $mac, cloudTunnel: $cloud, cameraName: "Tapo C520WS", channel: $ch, token: $tok, ts: $ts}' > tunnel.json
+
+            git config user.name "MagicSecurity Cloud 24/7"
+            git config user.email "cloud@magicsecurity.local"
+            git add tunnel.json
+            if ! git diff --cached --quiet; then
+              git commit -m "chore: update 24/7 cloud tunnel endpoint" && git push origin main || true
+            fi
+
+            if [ -n "$CHANNEL_ID" ]; then
+              curl -s -X POST "https://ntfy.sh/$CHANNEL_ID" \
+                -H "Content-Type: application/json" \
+                -d "{\"tunnel\":\"$CLOUD_URL\",\"cloudTunnel\":\"$CLOUD_URL\",\"macTunnel\":\"$MAC_TUN\",\"cameraName\":\"Tapo C520WS\",\"ts\":$TS}" >/dev/null || true
+            fi
+          }
+
+          if [ -n "$CLOUD_URL" ]; then
+            publish_state
+          fi
+
+          # Mantener vivo durante 5 horas (300 min), re-publicando cada 12 min
+          START_TS=$(date +%s)
+          while kill -0 "$BRIDGE_PID" 2>/dev/null && kill -0 "$CF_PID" 2>/dev/null; do
+            NOW_TS=$(date +%s)
+            ELAPSED=$((NOW_TS - START_TS))
+            if [ "$ELAPSED" -ge 18000 ]; then
+              echo "Rotando instancia Cloud 24/7 para continuidad infinita (50+ días)..."
+              break
+            fi
+            sleep 720
+            publish_state
+          done
+
+          # Disparar siguiente ciclo inmediatamente antes de salir
+          gh workflow run cloud-camera-24x7.yml --repo "${{ github.repository }}" || true
