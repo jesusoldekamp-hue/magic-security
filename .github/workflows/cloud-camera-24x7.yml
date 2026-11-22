@@ -30,6 +30,7 @@ jobs:
 
       - name: Run 24/7 Cloud Camera Bridge & Self-Renew
         env:
+          CAMERA_DDNS_HOST: ${{ secrets.CAMERA_DDNS_HOST }}
           CAMERA_PUBLIC_IP: ${{ secrets.CAMERA_PUBLIC_IP }}
           CAMERA_RTSP_PORT: ${{ secrets.CAMERA_RTSP_PORT }}
           CAMERA_ONVIF_PORT: ${{ secrets.CAMERA_ONVIF_PORT }}
@@ -56,24 +57,34 @@ jobs:
           echo "Cloud Tunnel active: $CLOUD_URL"
 
           publish_state() {
-            git pull --rebase origin main || true
-            MAC_TUN=$(jq -r '.macTunnel // ""' tunnel.json 2>/dev/null || echo "")
-            TS=$(date +%s)
-            jq -n \
-              --arg tun "${MAC_TUN:-$CLOUD_URL}" \
-              --arg mac "$MAC_TUN" \
-              --arg cloud "$CLOUD_URL" \
-              --arg ch "$CHANNEL_ID" \
-              --arg tok "$MOBILE_TOKEN" \
-              --argjson ts "$TS" \
-              '{tunnel: (if $mac != "" then $mac else $cloud end), macTunnel: $mac, cloudTunnel: $cloud, cameraName: "Tapo C520WS", channel: $ch, token: $tok, ts: $ts}' > tunnel.json
+            for attempt in 1 2; do
+              git fetch origin main || true
+              git reset --hard origin/main || true
+              MAC_TUN=$(jq -r '.macTunnel // ""' tunnel.json 2>/dev/null || echo "")
+              PUB_IP=$(jq -r '.publicIP // ""' tunnel.json 2>/dev/null || echo "")
+              if [ -z "$PUB_IP" ]; then PUB_IP="$CAMERA_PUBLIC_IP"; fi
+              TS=$(date +%s)
+              jq -n \
+                --arg tun "${MAC_TUN:-$CLOUD_URL}" \
+                --arg mac "$MAC_TUN" \
+                --arg cloud "$CLOUD_URL" \
+                --arg pub "$PUB_IP" \
+                --arg ch "$CHANNEL_ID" \
+                --arg tok "$MOBILE_TOKEN" \
+                --argjson ts "$TS" \
+                '{tunnel: (if $mac != "" then $mac else $cloud end), macTunnel: $mac, cloudTunnel: $cloud, publicIP: $pub, cameraName: "Tapo C520WS", channel: $ch, token: $tok, ts: $ts}' > tunnel.json
 
-            git config user.name "MagicSecurity Cloud 24/7"
-            git config user.email "cloud@magicsecurity.local"
-            git add tunnel.json
-            if ! git diff --cached --quiet; then
-              git commit -m "chore: update 24/7 cloud tunnel endpoint" && git push origin main || true
-            fi
+              git config user.name "MagicSecurity Cloud 24/7"
+              git config user.email "cloud@magicsecurity.local"
+              git add tunnel.json
+              if git diff --cached --quiet; then
+                break
+              fi
+              if git commit -m "chore: update 24/7 cloud tunnel endpoint" && git push origin main; then
+                break
+              fi
+              sleep 2
+            done
 
             if [ -n "$CHANNEL_ID" ]; then
               curl -s -X POST "https://ntfy.sh/$CHANNEL_ID" \

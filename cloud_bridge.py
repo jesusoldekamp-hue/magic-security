@@ -11,19 +11,31 @@ import hashlib
 import http.server
 import json
 import os
+import re
+import select
 import subprocess
 import threading
 import time
 import urllib.parse
 import urllib.request
 
-CAMERA_HOST = os.environ.get("CAMERA_PUBLIC_IP", "").strip()
+CAMERA_DDNS_HOST = os.environ.get("CAMERA_DDNS_HOST", "").strip()
+CAMERA_PUBLIC_IP_FALLBACK = os.environ.get("CAMERA_PUBLIC_IP", "").strip()
+TUNNEL_JSON_URL = os.environ.get(
+    "TUNNEL_JSON_URL",
+    "https://raw.githubusercontent.com/jesusoldekamp-hue/magic-security/main/tunnel.json",
+).strip()
 CAMERA_RTSP_PORT = int(os.environ.get("CAMERA_RTSP_PORT", "18554"))
 CAMERA_ONVIF_PORT = int(os.environ.get("CAMERA_ONVIF_PORT", "18020"))
 CAMERA_USER = os.environ.get("CAMERA_USER", "albertgod53").strip()
 CAMERA_PASS = os.environ.get("CAMERA_PASS", "").strip()
 MOBILE_TOKEN = os.environ.get("MOBILE_TOKEN", "45BwGjboYxfraNWL").strip()
 PORT = int(os.environ.get("PORT", "11988"))
+
+HOST_RE = re.compile(r"^[A-Za-z0-9.-]+$")
+host_lock = threading.Lock()
+cached_camera_host = CAMERA_DDNS_HOST or CAMERA_PUBLIC_IP_FALLBACK
+cached_host_ts = 0.0
 
 frame_lock = threading.Lock()
 latest_jpeg = None
@@ -33,16 +45,55 @@ invert_pan = False
 is_moving = False
 
 
+def get_active_camera_host(force=False):
+    """Resuelve el host/IP pública actual de casa (DDNS > tunnel.json publicIP > secret)."""
+    global cached_camera_host, cached_host_ts
+    if CAMERA_DDNS_HOST:
+        return CAMERA_DDNS_HOST
+    now = time.time()
+    with host_lock:
+        if not force and cached_camera_host and (now - cached_host_ts) < 30.0:
+            return cached_camera_host
+    fetched_ip = ""
+    if TUNNEL_JSON_URL:
+        try:
+            req = urllib.request.Request(
+                f"{TUNNEL_JSON_URL}?ts={int(now)}",
+                headers={"Cache-Control": "no-cache", "User-Agent": "MagicSecurityCloud/2.0"},
+            )
+            with urllib.request.urlopen(req, timeout=4.0) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                cand = str(data.get("publicIP") or "").strip()
+                if cand and HOST_RE.match(cand):
+                    fetched_ip = cand
+        except Exception:
+            pass
+    with host_lock:
+        if fetched_ip:
+            if fetched_ip != cached_camera_host:
+                print(f"MagicSecurity Cloud Bridge: active home IP updated -> {fetched_ip}", flush=True)
+            cached_camera_host = fetched_ip
+        elif not cached_camera_host and CAMERA_PUBLIC_IP_FALLBACK:
+            cached_camera_host = CAMERA_PUBLIC_IP_FALLBACK
+        cached_host_ts = now
+        return cached_camera_host
+
+
 def capture_loop():
     """Mantiene un hilo ligero de captura RTSP desde el router de casa hacia memoria."""
     global latest_jpeg, latest_frame_ts
-    if not CAMERA_HOST or not CAMERA_PASS:
-        return
     user_enc = urllib.parse.quote(CAMERA_USER.split("@")[0], safe="")
     pass_enc = urllib.parse.quote(CAMERA_PASS, safe="")
     while True:
+        host = get_active_camera_host(force=True)
+        if not host or not CAMERA_PASS:
+            time.sleep(5.0)
+            continue
         for stream_path in ["stream2", "stream1"]:
-            rtsp_url = f"rtsp://{user_enc}:{pass_enc}@{CAMERA_HOST}:{CAMERA_RTSP_PORT}/{stream_path}"
+            host = get_active_camera_host(force=True)
+            if not host:
+                break
+            rtsp_url = f"rtsp://{user_enc}:{pass_enc}@{host}:{CAMERA_RTSP_PORT}/{stream_path}"
             cmd = [
                 "ffmpeg", "-hide_banner", "-loglevel", "error",
                 "-rtsp_transport", "tcp",
@@ -56,17 +107,21 @@ def capture_loop():
                 "-q:v", "5",
                 "pipe:1"
             ]
+            proc = None
             try:
-                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=65536)
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+                fd = proc.stdout.fileno()
                 buf = bytearray()
                 last_read = time.time()
                 while proc.poll() is None:
-                    chunk = proc.stdout.read(16384)
-                    if not chunk:
-                        if time.time() - last_read > 8:
+                    ready, _, _ = select.select([fd], [], [], 2.0)
+                    if not ready:
+                        if time.time() - last_read > 12.0:
                             break
-                        time.sleep(0.02)
                         continue
+                    chunk = os.read(fd, 16384)
+                    if not chunk:
+                        break
                     last_read = time.time()
                     buf.extend(chunk)
                     while True:
@@ -86,12 +141,18 @@ def capture_loop():
                         with frame_lock:
                             latest_jpeg = frame
                             latest_frame_ts = time.time()
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
             except Exception:
                 pass
+            finally:
+                if proc is not None:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=1.5)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
         time.sleep(2.0)
 
 
@@ -117,16 +178,17 @@ def make_onvif_envelope(user, pw, body_xml):
 
 
 def send_onvif(op, body_xml):
-    if not CAMERA_HOST or not CAMERA_PASS:
+    host = get_active_camera_host()
+    if not host or not CAMERA_PASS:
         return False
     short_user = CAMERA_USER.split("@")[0]
     for candidate in [short_user, CAMERA_USER, "admin"]:
         xml = make_onvif_envelope(candidate, CAMERA_PASS, body_xml)
         req = urllib.request.Request(
-            f"http://{CAMERA_HOST}:{CAMERA_ONVIF_PORT}/onvif/ptz_service",
+            f"http://{host}:{CAMERA_ONVIF_PORT}/onvif/ptz_service",
             data=xml.encode(),
             headers={
-                "Host": f"{CAMERA_HOST}:{CAMERA_ONVIF_PORT}",
+                "Host": f"{host}:{CAMERA_ONVIF_PORT}",
                 "Content-Type": f"application/soap+xml; charset=utf-8; action=\"http://www.onvif.org/ver20/ptz/wsdl/{op}\""
             }
         )
@@ -218,7 +280,7 @@ class CloudHandler(http.server.BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/api/ping":
             with frame_lock:
-                has_frame = latest_jpeg is not None and (time.time() - latest_frame_ts) < 30
+                has_frame = latest_jpeg is not None and (time.time() - latest_frame_ts) < 25
             data = json.dumps({"alive": True, "cloud": True, "hasFrame": has_frame}).encode()
             self.send_cors_headers(200, "application/json; charset=utf-8", len(data))
             self.wfile.write(data)
@@ -232,7 +294,8 @@ class CloudHandler(http.server.BaseHTTPRequestHandler):
 
         if parsed.path == "/frame.jpg":
             with frame_lock:
-                jpg = latest_jpeg
+                fresh = latest_jpeg is not None and (time.time() - latest_frame_ts) < 25
+                jpg = latest_jpeg if fresh else None
             if not jpg:
                 msg = b"Conectando..."
                 self.send_cors_headers(503, "text/plain", len(msg))
@@ -243,6 +306,7 @@ class CloudHandler(http.server.BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/api/status":
+            host = get_active_camera_host()
             with frame_lock:
                 live = latest_jpeg is not None and (time.time() - latest_frame_ts) < 15
             payload = {
@@ -254,8 +318,8 @@ class CloudHandler(http.server.BaseHTTPRequestHandler):
                 "isSirenActive": False,
                 "invertTilt": invert_tilt,
                 "invertPan": invert_pan,
-                "routeText": f"En vivo · Cloud 24/7 ({CAMERA_HOST})",
-                "remoteHost": CAMERA_HOST
+                "routeText": f"En vivo · Cloud 24/7 ({host})",
+                "remoteHost": host
             }
             data = json.dumps(payload).encode()
             self.send_cors_headers(200, "application/json; charset=utf-8", len(data))
@@ -313,5 +377,5 @@ if __name__ == "__main__":
     t = threading.Thread(target=capture_loop, daemon=True)
     t.start()
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), CloudHandler)
-    print(f"MagicSecurity Cloud Bridge listening on 127.0.0.1:{PORT} -> {CAMERA_HOST}:{CAMERA_RTSP_PORT}/{CAMERA_ONVIF_PORT}", flush=True)
+    print(f"MagicSecurity Cloud Bridge listening on 127.0.0.1:{PORT} -> {get_active_camera_host()}:{CAMERA_RTSP_PORT}/{CAMERA_ONVIF_PORT}", flush=True)
     srv.serve_forever()

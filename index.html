@@ -300,7 +300,8 @@
   localStorage.setItem("ms_token", T);
 
   let BASE = localStorage.getItem("ms_base_" + C) || "";
-  let candidateBases = [];
+  let activeIsCloud = false;
+  let lastFrameOkAt = 0;
   let consecutiveErrors = 0;
   let isResolving = false;
 
@@ -346,28 +347,44 @@
     telemetryPill.textContent = `${fpsPart} · ${latPart}`;
   }
 
-  function addCandidate(url) {
+  function pushUnique(list, url, maxLen = 6) {
     if (!url || typeof url !== "string" || !url.startsWith("https://")) return;
     const clean = url.replace(/\/$/, "");
-    if (!candidateBases.includes(clean)) candidateBases.unshift(clean);
+    if (!list.includes(clean) && list.length < maxLen) list.push(clean);
   }
 
   async function probeBase(url) {
     try {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 3500);
-      const res = await fetch(`${url}/api/ping`, { cache: "no-store", signal: ctrl.signal });
+      const res = await fetch(`${url}/api/ping?ts=${Date.now()}`, { cache: "no-store", signal: ctrl.signal });
       clearTimeout(timer);
-      return res.ok;
+      if (!res.ok) return { url, ok: false, hasFrame: false, isCloud: false };
+      let hasFrame = true;
+      let isCloud = false;
+      try {
+        const data = await res.json();
+        if (typeof data.hasFrame === "boolean") hasFrame = data.hasFrame;
+        isCloud = Boolean(data.cloud);
+      } catch (_) {}
+      return { url, ok: true, hasFrame, isCloud };
     } catch (_) {
-      return false;
+      return { url, ok: false, hasFrame: false, isCloud: false };
     }
   }
 
-  async function resolveLatestTunnel() {
+  async function resolveLatestTunnel(options = {}) {
+    const { excludeUrl = "", force = false } = options;
+    if (!force && !excludeUrl && BASE && consecutiveErrors === 0 && lastFrameOkAt > 0 && (Date.now() - lastFrameOkAt) < 10000) {
+      return BASE;
+    }
     if (isResolving) return BASE;
     isResolving = true;
     try {
+      const macList = [];
+      const cloudList = [];
+      const otherList = [];
+
       // 1. Consultar tunnel.json en el mismo dominio github.io (nunca bloqueado ni expira en 50+ días)
       try {
         const res = await fetch(`./tunnel.json?ts=${Date.now()}`, { cache: "no-store" });
@@ -376,13 +393,13 @@
           if (info.cameraName) camTitle.textContent = info.cameraName;
           if (info.token && !params.get("t")) T = info.token;
           if (info.channel && !params.get("c")) C = info.channel;
-          addCandidate(info.cloudTunnel);
-          addCandidate(info.macTunnel);
-          addCandidate(info.tunnel);
+          pushUnique(macList, info.macTunnel);
+          pushUnique(cloudList, info.cloudTunnel);
+          pushUnique(otherList, info.tunnel);
         }
       } catch (_) {}
 
-      // 2. Consultar canal ntfy en tiempo real
+      // 2. Consultar canal ntfy en tiempo real (más recientes primero)
       if (C) {
         try {
           const res = await fetch(`https://ntfy.sh/${encodeURIComponent(C)}/json?poll=1&since=all`, { cache: "no-store" });
@@ -395,26 +412,49 @@
                 if (evt && evt.message) {
                   const payload = JSON.parse(evt.message);
                   if (payload.cameraName) camTitle.textContent = payload.cameraName;
-                  addCandidate(payload.cloudTunnel);
-                  addCandidate(payload.tunnel);
+                  pushUnique(macList, payload.macTunnel, 3);
+                  pushUnique(cloudList, payload.cloudTunnel, 3);
+                  if (payload.tunnel && payload.tunnel !== payload.cloudTunnel && payload.tunnel !== payload.macTunnel) {
+                    pushUnique(otherList, payload.tunnel, 3);
+                  }
                 }
               } catch (_) {}
+              if (macList.length >= 3 && cloudList.length >= 3) break;
             }
           }
         } catch (_) {}
       }
 
-      // 3. Probar candidatos y elegir el primero que responda /api/ping
-      for (const cand of candidateBases) {
-        if (await probeBase(cand)) {
-          BASE = cand;
-          localStorage.setItem("ms_base_" + C, BASE);
-          isResolving = false;
-          return BASE;
+      pushUnique(otherList, BASE, 4);
+
+      const ordered = [];
+      for (const u of [...macList, ...cloudList, ...otherList]) {
+        pushUnique(ordered, u, 8);
+      }
+
+      if (excludeUrl && ordered.length > 1) {
+        const idx = ordered.indexOf(excludeUrl);
+        if (idx >= 0) {
+          ordered.splice(idx, 1);
+          ordered.push(excludeUrl);
         }
       }
-      if (!BASE && candidateBases.length > 0) {
-        BASE = candidateBases[0];
+
+      // 3. Probar candidatos en paralelo y priorizar los que realmente entregan video (hasFrame: true)
+      const results = await Promise.all(ordered.map((cand) => probeBase(cand)));
+      const best =
+        results.find((r) => r.ok && r.hasFrame && r.url !== excludeUrl) ||
+        results.find((r) => r.ok && r.hasFrame) ||
+        results.find((r) => r.ok && r.url !== excludeUrl) ||
+        results.find((r) => r.ok);
+
+      if (best) {
+        BASE = best.url;
+        activeIsCloud = best.isCloud;
+        localStorage.setItem("ms_base_" + C, BASE);
+      } else if (!BASE && ordered.length > 0) {
+        BASE = ordered[0];
+        activeIsCloud = cloudList.includes(BASE);
       }
     } catch (_) {}
     isResolving = false;
@@ -424,7 +464,7 @@
   async function pullNextFrame() {
     if (document.visibilityState === "hidden") return;
     if (!BASE) {
-      await resolveLatestTunnel();
+      await resolveLatestTunnel({ force: true });
       if (!BASE) {
         stateBadge.textContent = "CONECTANDO CON CÁMARA 24/7…";
         clearTimeout(frameLoopTimer);
@@ -450,9 +490,10 @@
       cam.src = nextURL;
 
       consecutiveErrors = 0;
+      lastFrameOkAt = Date.now();
       lastLatencyMs = Math.round(performance.now() - t0);
       liveDot.classList.add("is-live");
-      stateBadge.textContent = "EN VIVO · 24/7";
+      stateBadge.textContent = activeIsCloud ? "EN VIVO · CLOUD 24/7" : "EN VIVO · 24/7";
       renderTelemetry();
       clearTimeout(frameLoopTimer);
       frameLoopTimer = setTimeout(pullNextFrame, 75);
@@ -461,11 +502,17 @@
       consecutiveErrors++;
       liveDot.classList.remove("is-live");
       stateBadge.textContent = "RECONECTANDO…";
+      let switched = false;
       if (consecutiveErrors >= 2) {
-        await resolveLatestTunnel();
+        const failedBase = BASE;
+        await resolveLatestTunnel({ excludeUrl: failedBase, force: true });
+        if (BASE && BASE !== failedBase) {
+          consecutiveErrors = 0;
+          switched = true;
+        }
       }
       clearTimeout(frameLoopTimer);
-      frameLoopTimer = setTimeout(pullNextFrame, 850);
+      frameLoopTimer = setTimeout(pullNextFrame, switched ? 150 : 850);
     }
   }
 
@@ -643,12 +690,12 @@
     }
   });
 
-  resolveLatestTunnel().then(() => {
+  resolveLatestTunnel({ force: true }).then(() => {
     pullNextFrame();
     pollStatus();
   });
   setInterval(pollStatus, 3500);
-  setInterval(resolveLatestTunnel, 20000);
+  setInterval(() => resolveLatestTunnel(), 20000);
 })();
 </script>
 </body>
