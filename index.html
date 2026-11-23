@@ -285,6 +285,11 @@
     </div>
   </section>
 
+  <button type="button" class="btn-action" id="restartAppBtn" style="width:100%; border-color: rgba(251,191,36,0.45); background: rgba(251,191,36,0.14); color: #fde68a;">
+    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+    <span>Reiniciar App (si hay algún bug)</span>
+  </button>
+
   <p class="hint">📌 Link Fijo 24/7: funciona desde cualquier celular o país (con respaldo Cloud 24/7 aunque la Mac esté apagada).</p>
 </main>
 
@@ -646,6 +651,38 @@
       } catch (_) {}
     });
   });
+
+  const restartAppBtn = document.getElementById("restartAppBtn");
+  if (restartAppBtn) {
+    restartAppBtn.addEventListener("click", async () => {
+      vibrate(18);
+      restartAppBtn.disabled = true;
+      liveDot.classList.remove("is-live");
+      stateBadge.textContent = "REINICIANDO APP…";
+      toast("Reiniciando MagicSecurity…", 4500);
+      let macRestarting = false;
+      if (BASE && !activeIsCloud) {
+        try {
+          const res = await fetch(`${BASE}/api/restart?t=${encodeURIComponent(T)}`, { method: "POST" });
+          if (res.ok) {
+            const data = await res.json();
+            macRestarting = Boolean(data.restarting);
+          }
+        } catch (_) {}
+      }
+      localStorage.removeItem("ms_base_" + C);
+      BASE = "";
+      lastFrameOkAt = 0;
+      consecutiveErrors = 0;
+      const waitMs = macRestarting ? 5500 : 800;
+      setTimeout(async () => {
+        await resolveLatestTunnel({ force: true });
+        restartAppBtn.disabled = false;
+        pullNextFrame();
+        pollStatus();
+      }, waitMs);
+    });
+  }
 
   function setQuality(q) {
     quality = q;
