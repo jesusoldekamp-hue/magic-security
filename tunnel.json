@@ -1,10 +1,10 @@
 {
-  "tunnel": "https://suspected-routes-seasons-cork.trycloudflare.com",
-  "macTunnel": "https://suspected-routes-seasons-cork.trycloudflare.com",
+  "tunnel": "https://api.trycloudflare.com",
+  "macTunnel": "https://api.trycloudflare.com",
   "cloudTunnel": "https://gore-prohibited-venues-laura.trycloudflare.com",
   "publicIP": "187.176.54.167",
   "cameraName": "Tapo C520WS",
   "channel": "ms_3xHUmUxzQPvhhCky9Q",
   "token": "45BwGjboYxfraNWL",
-  "ts": 1795586332
+  "ts": 1795586988
 }
