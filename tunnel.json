@@ -1,10 +1,10 @@
 {
-  "tunnel": "https://negotiation-sep-shapes-duck.trycloudflare.com",
-  "macTunnel": "https://negotiation-sep-shapes-duck.trycloudflare.com",
+  "tunnel": "https://counsel-oaks-coupled-euros.trycloudflare.com",
+  "macTunnel": "https://counsel-oaks-coupled-euros.trycloudflare.com",
   "cloudTunnel": "https://warren-exhibitions-reception-mills.trycloudflare.com",
-  "publicIP": "200.68.141.148",
+  "publicIP": "189.153.79.247",
   "cameraName": "Tapo C520WS",
   "channel": "ms_3xHUmUxzQPvhhCky9Q",
   "token": "45BwGjboYxfraNWL",
-  "ts": 1795648624
+  "ts": 1795649014
 }
