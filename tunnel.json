@@ -1,10 +1,10 @@
 {
-  "tunnel": "https://api.trycloudflare.com",
-  "macTunnel": "https://api.trycloudflare.com",
+  "tunnel": "https://binary-plays-regardless-watson.trycloudflare.com",
+  "macTunnel": "https://binary-plays-regardless-watson.trycloudflare.com",
   "cloudTunnel": "https://criterion-implied-declare-edwards.trycloudflare.com",
-  "publicIP": "189.153.58.196",
+  "publicIP": "187.190.171.25",
   "cameraName": "Tapo C520WS",
   "channel": "ms_3xHUmUxzQPvhhCky9Q",
   "token": "45BwGjboYxfraNWL",
-  "ts": 1795722569
+  "ts": 1795722575
 }
