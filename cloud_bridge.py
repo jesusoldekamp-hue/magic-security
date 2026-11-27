@@ -21,10 +21,13 @@ import urllib.request
 
 CAMERA_DDNS_HOST = os.environ.get("CAMERA_DDNS_HOST", "").strip()
 CAMERA_PUBLIC_IP_FALLBACK = os.environ.get("CAMERA_PUBLIC_IP", "").strip()
-TUNNEL_JSON_URL = os.environ.get(
-    "TUNNEL_JSON_URL",
+TUNNEL_JSON_URLS = [
+    os.environ.get(
+        "TUNNEL_JSON_URL",
+        "https://jesusoldekamp-hue.github.io/magic-security/tunnel.json",
+    ).strip(),
     "https://raw.githubusercontent.com/jesusoldekamp-hue/magic-security/main/tunnel.json",
-).strip()
+]
 CAMERA_RTSP_PORT = int(os.environ.get("CAMERA_RTSP_PORT", "18554"))
 CAMERA_ONVIF_PORT = int(os.environ.get("CAMERA_ONVIF_PORT", "18020"))
 CAMERA_USER = os.environ.get("CAMERA_USER", "albertgod53").strip()
@@ -40,9 +43,15 @@ cached_host_ts = 0.0
 frame_lock = threading.Lock()
 latest_jpeg = None
 latest_frame_ts = 0.0
+active_stream_label = "HD"
+frame_times = []
+force_reconnect_event = threading.Event()
 invert_tilt = False
 invert_pan = False
 is_moving = False
+is_patrol_active = False
+patrol_lock = threading.Lock()
+patrol_stop_event = threading.Event()
 
 
 def get_active_camera_host(force=False):
@@ -55,19 +64,22 @@ def get_active_camera_host(force=False):
         if not force and cached_camera_host and (now - cached_host_ts) < 30.0:
             return cached_camera_host
     fetched_ip = ""
-    if TUNNEL_JSON_URL:
+    for url in TUNNEL_JSON_URLS:
+        if not url:
+            continue
         try:
             req = urllib.request.Request(
-                f"{TUNNEL_JSON_URL}?ts={int(now)}",
-                headers={"Cache-Control": "no-cache", "User-Agent": "MagicSecurityCloud/2.0"},
+                f"{url}?ts={int(now)}",
+                headers={"Cache-Control": "no-cache", "User-Agent": "MagicSecurityCloud/3.0"},
             )
             with urllib.request.urlopen(req, timeout=4.0) as resp:
                 data = json.loads(resp.read().decode("utf-8", errors="ignore"))
                 cand = str(data.get("publicIP") or "").strip()
                 if cand and HOST_RE.match(cand):
                     fetched_ip = cand
+                    break
         except Exception:
-            pass
+            continue
     with host_lock:
         if fetched_ip:
             if fetched_ip != cached_camera_host:
@@ -80,16 +92,21 @@ def get_active_camera_host(force=False):
 
 
 def capture_loop():
-    """Mantiene un hilo ligero de captura RTSP desde el router de casa hacia memoria."""
-    global latest_jpeg, latest_frame_ts
+    """Mantiene captura RTSP HD (stream1 2K -> 1600px nítido con fallback a stream2) hacia memoria."""
+    global latest_jpeg, latest_frame_ts, active_stream_label
     user_enc = urllib.parse.quote(CAMERA_USER.split("@")[0], safe="")
     pass_enc = urllib.parse.quote(CAMERA_PASS, safe="")
+    profiles = [
+        ("stream1", "scale='min(1600,iw)':-1:flags=lanczos,unsharp=5:5:0.75:3:3:0.0,eq=contrast=1.05:saturation=1.05", "12", "3", "2K HD"),
+        ("stream2", "scale=960:-1:flags=lanczos,unsharp=3:3:0.5:3:3:0.0", "12", "4", "SD"),
+    ]
     while True:
+        force_reconnect_event.clear()
         host = get_active_camera_host(force=True)
         if not host or not CAMERA_PASS:
             time.sleep(5.0)
             continue
-        for stream_path in ["stream2", "stream1"]:
+        for stream_path, vf, fps_str, qv, label in profiles:
             host = get_active_camera_host(force=True)
             if not host:
                 break
@@ -99,27 +116,30 @@ def capture_loop():
                 "-rtsp_transport", "tcp",
                 "-fflags", "+nobuffer+discardcorrupt",
                 "-flags", "low_delay",
+                "-probesize", "500000",
+                "-analyzeduration", "1500000",
                 "-i", rtsp_url,
-                "-vf", "scale=960:-1",
-                "-r", "10",
+                "-vf", vf,
+                "-r", fps_str,
                 "-f", "image2pipe",
                 "-vcodec", "mjpeg",
-                "-q:v", "5",
+                "-q:v", qv,
                 "pipe:1"
             ]
             proc = None
+            got_any_frame = False
             try:
                 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
                 fd = proc.stdout.fileno()
                 buf = bytearray()
                 last_read = time.time()
-                while proc.poll() is None:
-                    ready, _, _ = select.select([fd], [], [], 2.0)
+                while proc.poll() is None and not force_reconnect_event.is_set():
+                    ready, _, _ = select.select([fd], [], [], 1.5)
                     if not ready:
                         if time.time() - last_read > 12.0:
                             break
                         continue
-                    chunk = os.read(fd, 16384)
+                    chunk = os.read(fd, 32768)
                     if not chunk:
                         break
                     last_read = time.time()
@@ -133,14 +153,21 @@ def capture_loop():
                         if eoi < 0:
                             if soi > 0:
                                 del buf[:soi]
-                            if len(buf) > 2_000_000:
+                            if len(buf) > 4_000_000:
                                 buf.clear()
                             break
                         frame = bytes(buf[soi:eoi + 2])
                         del buf[:eoi + 2]
+                        now_f = time.time()
+                        got_any_frame = True
                         with frame_lock:
                             latest_jpeg = frame
-                            latest_frame_ts = time.time()
+                            latest_frame_ts = now_f
+                            active_stream_label = label
+                            frame_times.append(now_f)
+                            cutoff = now_f - 3.0
+                            while frame_times and frame_times[0] < cutoff:
+                                frame_times.pop(0)
             except Exception:
                 pass
             finally:
@@ -153,7 +180,9 @@ def capture_loop():
                             proc.kill()
                         except Exception:
                             pass
-        time.sleep(2.0)
+            if got_any_frame or force_reconnect_event.is_set():
+                break
+        time.sleep(1.5)
 
 
 def make_onvif_envelope(user, pw, body_xml):
@@ -212,6 +241,37 @@ STEPS = {
 }
 
 
+def stop_patrol():
+    global is_patrol_active
+    with patrol_lock:
+        is_patrol_active = False
+        patrol_stop_event.set()
+
+
+def toggle_patrol():
+    global is_patrol_active
+    with patrol_lock:
+        if is_patrol_active:
+            is_patrol_active = False
+            patrol_stop_event.set()
+            return False
+        is_patrol_active = True
+        patrol_stop_event.clear()
+
+    def _run():
+        idx = 0
+        while not patrol_stop_event.is_set():
+            num = (idx % 3) + 1
+            idx += 1
+            body = f"""<tptz:GotoPreset xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl"><tptz:ProfileToken>profile_1</tptz:ProfileToken><tptz:PresetToken>{num}</tptz:PresetToken></tptz:GotoPreset>"""
+            send_onvif("GotoPreset", body)
+            if patrol_stop_event.wait(12.0):
+                break
+
+    threading.Thread(target=_run, daemon=True).start()
+    return True
+
+
 def execute_ptz(action, direction, speed):
     global invert_tilt, invert_pan, is_moving
     pan_mult = 1.0 if invert_pan else -1.0
@@ -223,7 +283,18 @@ def execute_ptz(action, direction, speed):
     if action == "invert_pan":
         invert_pan = not invert_pan
         return True
+    if action == "patrol":
+        toggle_patrol()
+        return True
+    if action == "save_preset":
+        stop_patrol()
+        num = direction.replace("p", "")
+        if num not in ("1", "2", "3"):
+            return False
+        body = f"""<tptz:SetPreset xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl"><tptz:ProfileToken>profile_1</tptz:ProfileToken><tptz:PresetName>Posicion {num}</tptz:PresetName><tptz:PresetToken>{num}</tptz:PresetToken></tptz:SetPreset>"""
+        return send_onvif("SetPreset", body)
     if action == "stop" or direction == "stop":
+        stop_patrol()
         is_moving = False
         body = """<tptz:Stop xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl"><tptz:ProfileToken>profile_1</tptz:ProfileToken><tptz:PanTilt>true</tptz:PanTilt><tptz:Zoom>true</tptz:Zoom></tptz:Stop>"""
         return send_onvif("Stop", body)
@@ -235,6 +306,8 @@ def execute_ptz(action, direction, speed):
     d_clean = direction.replace("-", "").replace("_", "")
     if d_clean not in VECTORS:
         return False
+
+    stop_patrol()
 
     if action == "start":
         vx, vy = VECTORS[d_clean]
@@ -307,21 +380,33 @@ class CloudHandler(http.server.BaseHTTPRequestHandler):
 
         if parsed.path == "/api/status":
             host = get_active_camera_host()
+            now_s = time.time()
             with frame_lock:
-                live = latest_jpeg is not None and (time.time() - latest_frame_ts) < 15
+                live = latest_jpeg is not None and (now_s - latest_frame_ts) < 15
+                recent = [t for t in frame_times if now_s - t <= 3.0]
+                fps_est = int(round(len(recent) / 3.0)) if live else 0
+                stream_lbl = active_stream_label
             payload = {
                 "cameraName": "Tapo C520WS",
                 "isLive": live,
-                "fps": 10 if live else 0,
+                "fps": max(1, fps_est) if live else 0,
                 "isMoving": is_moving,
-                "ptzStatus": "",
+                "isPatrolActive": is_patrol_active,
+                "ptzStatus": "Patrulla activa (P1 → P2 → P3)" if is_patrol_active else "",
                 "isSirenActive": False,
                 "invertTilt": invert_tilt,
                 "invertPan": invert_pan,
-                "routeText": f"En vivo · Cloud 24/7 ({host})",
-                "remoteHost": host
+                "routeText": f"En vivo · Cloud {stream_lbl} ({host})",
+                "remoteHost": host,
+                "eventCount": 0
             }
             data = json.dumps(payload).encode()
+            self.send_cors_headers(200, "application/json; charset=utf-8", len(data))
+            self.wfile.write(data)
+            return
+
+        if parsed.path == "/api/events":
+            data = json.dumps({"events": []}).encode()
             self.send_cors_headers(200, "application/json; charset=utf-8", len(data))
             self.wfile.write(data)
             return
@@ -362,8 +447,16 @@ class CloudHandler(http.server.BaseHTTPRequestHandler):
                 "invertTilt": invert_tilt,
                 "invertPan": invert_pan,
                 "isMoving": is_moving,
-                "status": ""
+                "isPatrolActive": is_patrol_active,
+                "status": "Patrulla activa" if is_patrol_active else ""
             }).encode()
+            self.send_cors_headers(200, "application/json; charset=utf-8", len(data))
+            self.wfile.write(data)
+            return
+
+        if parsed.path == "/api/restart":
+            force_reconnect_event.set()
+            data = json.dumps({"ok": True, "restarting": False, "cloud": True}).encode()
             self.send_cors_headers(200, "application/json; charset=utf-8", len(data))
             self.wfile.write(data)
             return

@@ -40,23 +40,30 @@ jobs:
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python3 cloud_bridge.py &
-          BRIDGE_PID=$!
+          start_bridge() {
+            python3 cloud_bridge.py &
+            BRIDGE_PID=$!
+          }
+
+          start_tunnel() {
+            rm -f /tmp/cf.log
+            cloudflared tunnel --no-autoupdate --url http://127.0.0.1:11988 > /tmp/cf.log 2>&1 &
+            CF_PID=$!
+            CLOUD_URL=""
+            for i in $(seq 1 30); do
+              CLOUD_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cf.log | head -n 1 || true)
+              if [ -n "$CLOUD_URL" ]; then break; fi
+              sleep 1
+            done
+            echo "Cloud Tunnel active: $CLOUD_URL"
+          }
+
+          start_bridge
           sleep 2
-
-          cloudflared tunnel --no-autoupdate --url http://127.0.0.1:11988 > /tmp/cf.log 2>&1 &
-          CF_PID=$!
-
-          CLOUD_URL=""
-          for i in $(seq 1 30); do
-            CLOUD_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cf.log | head -n 1 || true)
-            if [ -n "$CLOUD_URL" ]; then break; fi
-            sleep 1
-          done
-
-          echo "Cloud Tunnel active: $CLOUD_URL"
+          start_tunnel
 
           publish_state() {
+            [ -z "$CLOUD_URL" ] && return
             for attempt in 1 2; do
               git fetch origin main || true
               git reset --hard origin/main || true
@@ -93,22 +100,61 @@ jobs:
             fi
           }
 
-          if [ -n "$CLOUD_URL" ]; then
-            publish_state
-          fi
+          publish_state
 
-          # Mantener vivo durante 5 horas (300 min), re-publicando cada 12 min
+          # Mantener vivo ~5 horas con auto-curación cada 60 s y relevo sin corte al final
           START_TS=$(date +%s)
-          while kill -0 "$BRIDGE_PID" 2>/dev/null && kill -0 "$CF_PID" 2>/dev/null; do
+          LAST_PUB_TS=$START_TS
+          PING_FAILS=0
+          HANDOFF_TRIGGERED=0
+
+          while true; do
             NOW_TS=$(date +%s)
             ELAPSED=$((NOW_TS - START_TS))
-            if [ "$ELAPSED" -ge 18000 ]; then
-              echo "Rotando instancia Cloud 24/7 para continuidad infinita (50+ días)..."
+
+            # Auto-curar puente Python si muere
+            if ! kill -0 "$BRIDGE_PID" 2>/dev/null; then
+              echo "Reiniciando cloud_bridge.py..."
+              start_bridge
+              sleep 2
+            fi
+
+            # Auto-curar túnel cloudflared si muere o falla 3 pings seguidos
+            TUNNEL_OK=0
+            if kill -0 "$CF_PID" 2>/dev/null && [ -n "$CLOUD_URL" ]; then
+              if curl -fsS --max-time 6 "$CLOUD_URL/api/ping" >/dev/null 2>&1; then
+                TUNNEL_OK=1
+                PING_FAILS=0
+              else
+                PING_FAILS=$((PING_FAILS + 1))
+              fi
+            else
+              PING_FAILS=3
+            fi
+
+            if [ "$PING_FAILS" -ge 3 ]; then
+              echo "Túnel caído ($PING_FAILS fallos); renovando cloudflared al instante..."
+              kill "$CF_PID" 2>/dev/null || true
+              sleep 1
+              start_tunnel
+              PING_FAILS=0
+              publish_state
+              LAST_PUB_TS=$NOW_TS
+            elif [ $((NOW_TS - LAST_PUB_TS)) -ge 600 ]; then
+              publish_state
+              LAST_PUB_TS=$NOW_TS
+            fi
+
+            # Relevo con solapamiento (zero-downtime): dispara siguiente instancia a las 4h55m y mantiene viva esta 50 s más
+            if [ "$ELAPSED" -ge 17700 ] && [ "$HANDOFF_TRIGGERED" -eq 0 ]; then
+              echo "Lanzando siguiente turno Cloud 24/7 con solapamiento sin cortes..."
+              gh workflow run cloud-camera-24x7.yml --repo "${{ github.repository }}" || true
+              HANDOFF_TRIGGERED=1
+            fi
+            if [ "$ELAPSED" -ge 17755 ]; then
+              echo "Turno completado limpiamente."
               break
             fi
-            sleep 720
-            publish_state
-          done
 
-          # Disparar siguiente ciclo inmediatamente antes de salir
-          gh workflow run cloud-camera-24x7.yml --repo "${{ github.repository }}" || true
+            sleep 60
+          done
