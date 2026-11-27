@@ -1,10 +1,10 @@
 {
-  "tunnel": "https://hearings-included-stop-broadcast.trycloudflare.com",
-  "macTunnel": "https://hearings-included-stop-broadcast.trycloudflare.com",
+  "tunnel": "https://benjamin-diamonds-savings-labour.trycloudflare.com",
+  "macTunnel": "https://benjamin-diamonds-savings-labour.trycloudflare.com",
   "cloudTunnel": "https://fifteen-acm-seven-basement.trycloudflare.com",
   "publicIP": "189.153.79.247",
   "cameraName": "Tapo C520WS",
   "channel": "ms_3xHUmUxzQPvhhCky9Q",
   "token": "45BwGjboYxfraNWL",
-  "ts": 1795792352
+  "ts": 1795792761
 }
