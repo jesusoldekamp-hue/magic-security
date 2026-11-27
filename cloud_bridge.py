@@ -38,7 +38,10 @@ PORT = int(os.environ.get("PORT", "11988"))
 HOST_RE = re.compile(r"^[A-Za-z0-9.-]+$")
 host_lock = threading.Lock()
 cached_camera_host = CAMERA_DDNS_HOST or CAMERA_PUBLIC_IP_FALLBACK
+cached_mac_tunnel = ""
 cached_host_ts = 0.0
+cached_mac_alive = False
+cached_mac_check_ts = 0.0
 
 frame_lock = threading.Lock()
 latest_jpeg = None
@@ -54,59 +57,103 @@ patrol_lock = threading.Lock()
 patrol_stop_event = threading.Event()
 
 
-def get_active_camera_host(force=False):
-    """Resuelve el host/IP pública actual de casa (DDNS > tunnel.json publicIP > secret)."""
-    global cached_camera_host, cached_host_ts
-    if CAMERA_DDNS_HOST:
-        return CAMERA_DDNS_HOST
+def refresh_tunnel_metadata(force=False):
+    """Refresca publicIP y macTunnel desde tunnel.json (GitHub Pages > raw main)."""
+    global cached_camera_host, cached_mac_tunnel, cached_host_ts
     now = time.time()
     with host_lock:
-        if not force and cached_camera_host and (now - cached_host_ts) < 30.0:
-            return cached_camera_host
+        if not force and cached_camera_host and (now - cached_host_ts) < 25.0:
+            return cached_camera_host, cached_mac_tunnel
     fetched_ip = ""
+    fetched_mac = ""
     for url in TUNNEL_JSON_URLS:
         if not url:
             continue
         try:
             req = urllib.request.Request(
                 f"{url}?ts={int(now)}",
-                headers={"Cache-Control": "no-cache", "User-Agent": "MagicSecurityCloud/3.0"},
+                headers={"Cache-Control": "no-cache", "User-Agent": "MagicSecurityCloud/3.1"},
             )
             with urllib.request.urlopen(req, timeout=4.0) as resp:
                 data = json.loads(resp.read().decode("utf-8", errors="ignore"))
-                cand = str(data.get("publicIP") or "").strip()
-                if cand and HOST_RE.match(cand):
-                    fetched_ip = cand
+                cand_ip = str(data.get("publicIP") or "").strip()
+                cand_mac = str(data.get("macTunnel") or "").strip().rstrip("/")
+                if cand_ip and HOST_RE.match(cand_ip):
+                    fetched_ip = cand_ip
+                if cand_mac.startswith("https://"):
+                    fetched_mac = cand_mac
+                if fetched_ip or fetched_mac:
                     break
         except Exception:
             continue
     with host_lock:
-        if fetched_ip:
+        if CAMERA_DDNS_HOST:
+            cached_camera_host = CAMERA_DDNS_HOST
+        elif fetched_ip:
             if fetched_ip != cached_camera_host:
                 print(f"MagicSecurity Cloud Bridge: active home IP updated -> {fetched_ip}", flush=True)
             cached_camera_host = fetched_ip
         elif not cached_camera_host and CAMERA_PUBLIC_IP_FALLBACK:
             cached_camera_host = CAMERA_PUBLIC_IP_FALLBACK
+        if fetched_mac:
+            cached_mac_tunnel = fetched_mac
         cached_host_ts = now
-        return cached_camera_host
+        return cached_camera_host, cached_mac_tunnel
+
+
+def get_active_camera_host(force=False):
+    if CAMERA_DDNS_HOST:
+        return CAMERA_DDNS_HOST
+    host, _ = refresh_tunnel_metadata(force=force)
+    return host
+
+
+def is_mac_online(force=False):
+    """Detecta si MagicSecurity en la Mac está encendido para cederle stream1 2K sin pelear con el límite RTSP de la Tapo."""
+    global cached_mac_alive, cached_mac_check_ts
+    now = time.time()
+    with host_lock:
+        if not force and (now - cached_mac_check_ts) < 20.0:
+            return cached_mac_alive
+    _, mac_url = refresh_tunnel_metadata(force=force)
+    alive = False
+    if mac_url:
+        try:
+            req = urllib.request.Request(
+                f"{mac_url}/api/ping?ts={int(now)}",
+                headers={"Cache-Control": "no-cache", "User-Agent": "MagicSecurityCloud/3.1"},
+            )
+            with urllib.request.urlopen(req, timeout=3.5) as resp:
+                if 200 <= resp.status < 300:
+                    payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                    alive = bool(payload.get("alive")) and not bool(payload.get("cloud"))
+        except Exception:
+            alive = False
+    with host_lock:
+        if alive != cached_mac_alive:
+            print(f"MagicSecurity Cloud Bridge: Mac online={alive} (stream1={'Mac' if alive else 'Cloud 2K'})", flush=True)
+        cached_mac_alive = alive
+        cached_mac_check_ts = now
+        return alive
 
 
 def capture_loop():
-    """Mantiene captura RTSP HD (stream1 2K -> 1600px nítido con fallback a stream2) hacia memoria."""
+    """Captura inteligente: usa stream1 (2K -> 1600px HD) cuando la Mac está apagada; cede stream1 a la Mac (usando stream2 nítido de respaldo) cuando la Mac está encendida."""
     global latest_jpeg, latest_frame_ts, active_stream_label
     user_enc = urllib.parse.quote(CAMERA_USER.split("@")[0], safe="")
     pass_enc = urllib.parse.quote(CAMERA_PASS, safe="")
-    profiles = [
-        ("stream1", "scale='min(1600,iw)':-1:flags=lanczos,unsharp=5:5:0.75:3:3:0.0,eq=contrast=1.05:saturation=1.05", "12", "3", "2K HD"),
-        ("stream2", "scale=960:-1:flags=lanczos,unsharp=3:3:0.5:3:3:0.0", "12", "4", "SD"),
-    ]
+    profile_hd = ("stream1", "scale='min(1600,iw)':-1:flags=lanczos,unsharp=5:5:0.75:3:3:0.0,eq=contrast=1.05:saturation=1.05", "12", "3", "2K HD")
+    profile_backup = ("stream2", "scale=960:-1:flags=lanczos,unsharp=3:3:0.65:3:3:0.0,eq=contrast=1.04:saturation=1.04", "10", "4", "Respaldo")
+
     while True:
         force_reconnect_event.clear()
         host = get_active_camera_host(force=True)
         if not host or not CAMERA_PASS:
             time.sleep(5.0)
             continue
-        for stream_path, vf, fps_str, qv, label in profiles:
+        mac_up = is_mac_online(force=True)
+        ordered_profiles = [profile_backup] if mac_up else [profile_hd, profile_backup]
+        for stream_path, vf, fps_str, qv, label in ordered_profiles:
             host = get_active_camera_host(force=True)
             if not host:
                 break
@@ -128,6 +175,7 @@ def capture_loop():
             ]
             proc = None
             got_any_frame = False
+            last_mac_poll = time.time()
             try:
                 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
                 fd = proc.stdout.fileno()
@@ -135,14 +183,22 @@ def capture_loop():
                 last_read = time.time()
                 while proc.poll() is None and not force_reconnect_event.is_set():
                     ready, _, _ = select.select([fd], [], [], 1.5)
+                    now_loop = time.time()
+                    # Re-evaluar cada 22 s si la Mac se encendió o se apagó para promover/ceder stream1 automáticamente
+                    if now_loop - last_mac_poll >= 22.0:
+                        last_mac_poll = now_loop
+                        mac_now = is_mac_online(force=True)
+                        if mac_now != mac_up:
+                            print(f"MagicSecurity Cloud Bridge: switching stream mode (mac_up {mac_up} -> {mac_now})", flush=True)
+                            break
                     if not ready:
-                        if time.time() - last_read > 12.0:
+                        if now_loop - last_read > 12.0:
                             break
                         continue
                     chunk = os.read(fd, 32768)
                     if not chunk:
                         break
-                    last_read = time.time()
+                    last_read = now_loop
                     buf.extend(chunk)
                     while True:
                         soi = buf.find(b"\xff\xd8")
@@ -182,7 +238,7 @@ def capture_loop():
                             pass
             if got_any_frame or force_reconnect_event.is_set():
                 break
-        time.sleep(1.5)
+        time.sleep(1.2)
 
 
 def make_onvif_envelope(user, pw, body_xml):
