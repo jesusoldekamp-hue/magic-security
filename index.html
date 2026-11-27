@@ -726,12 +726,16 @@
         <div class="stage-hud">
           <div class="hud-group">
             <span class="badge" id="stateBadge"><span class="badge-dot" aria-hidden="true"></span><span id="stateText">CONECTANDO…</span></span>
+            <span class="badge is-patrol" id="spotlightBadge" hidden>LINTERNA ON</span>
             <span class="badge is-patrol" id="patrolBadge" hidden>PATRULLA</span>
           </div>
           <span class="badge is-alert" id="sirenBadge" hidden>ALARMA ACTIVA</span>
         </div>
         <div class="toast-hud" id="toastHud" role="status" aria-live="polite"></div>
         <div class="video-tools">
+          <button type="button" class="tool-btn is-night" id="spotlightToolBtn" aria-pressed="false" aria-label="Encender o apagar linterna LED física de la cámara">
+            <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18h6"/><path d="M10 22h4"/><path d="M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg>
+          </button>
           <button type="button" class="tool-btn is-night" id="nightBtn" aria-pressed="false" aria-label="Realce nocturno">
             <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
           </button>
@@ -810,10 +814,10 @@
         </div>
       </section>
 
-      <section class="panel" aria-label="Voz en vivo y alarma">
+      <section class="panel" aria-label="Voz en vivo, linterna y alarma">
         <div class="panel-head">
-          <h2>Voz y Alarma</h2>
-          <span class="panel-status">Bocina de la cámara</span>
+          <h2>Voz, Linterna y Alarma</h2>
+          <span class="panel-status">Bocina y LED físico</span>
         </div>
 
         <form class="speak-form" id="speakForm">
@@ -833,19 +837,19 @@
         <div class="siren-grid">
           <button type="button" class="btn-action btn-danger" data-siren="police">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 18v-6a5 5 0 0 1 10 0v6"/><path d="M5 21h14"/><line x1="12" y1="2" x2="12" y2="4"/></svg>
-            <span>Sirena (7s)</span>
+            <span>Sirena (30s)</span>
           </button>
           <button type="button" class="btn-action" data-siren="stop">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
             <span>Detener Audio</span>
           </button>
+          <button type="button" class="btn-action" id="spotlightBtn" aria-pressed="false">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18h6"/><path d="M10 22h4"/><path d="M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg>
+            <span id="spotlightBtnLabel">Linterna LED</span>
+          </button>
           <button type="button" class="btn-action" data-siren="voice">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/></svg>
             <span>Voz Aviso</span>
-          </button>
-          <button type="button" class="btn-action" data-siren="beep">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
-            <span>Pitido Alerta</span>
           </button>
         </div>
       </section>
@@ -900,6 +904,7 @@
   const liveDot = document.getElementById("liveDot");
   const stateBadge = document.getElementById("stateBadge");
   const stateText = document.getElementById("stateText");
+  const spotlightBadge = document.getElementById("spotlightBadge");
   const patrolBadge = document.getElementById("patrolBadge");
   const sirenBadge = document.getElementById("sirenBadge");
   const telemetryPill = document.getElementById("telemetryPill");
@@ -908,6 +913,9 @@
   const dpadRing = document.getElementById("dpadRing");
   const qSdBtn = document.getElementById("qSdBtn");
   const qHdBtn = document.getElementById("qHdBtn");
+  const spotlightToolBtn = document.getElementById("spotlightToolBtn");
+  const spotlightBtn = document.getElementById("spotlightBtn");
+  const spotlightBtnLabel = document.getElementById("spotlightBtnLabel");
   const nightBtn = document.getElementById("nightBtn");
   const zoomBtn = document.getElementById("zoomBtn");
   const snapBtn = document.getElementById("snapBtn");
@@ -1169,6 +1177,7 @@
       if (data.cameraName) camTitle.textContent = data.cameraName;
       serverFPS = Number(data.fps || 0);
       sirenBadge.hidden = !Boolean(data.isSirenActive);
+      if (typeof data.isSpotlightOn === "boolean") renderSpotlight(data.isSpotlightOn);
       const patrolling = Boolean(data.isPatrolActive);
       patrolBadge.hidden = !patrolling;
       patrolBtn.setAttribute("aria-pressed", String(patrolling));
@@ -1499,6 +1508,43 @@
       speakText(btn.dataset.phrase);
     });
   });
+
+  function renderSpotlight(isOn) {
+    spotlightBadge.hidden = !isOn;
+    spotlightToolBtn.setAttribute("aria-pressed", String(isOn));
+    spotlightBtn.setAttribute("aria-pressed", String(isOn));
+    spotlightBtn.classList.toggle("btn-warn", isOn);
+    spotlightBtnLabel.textContent = isOn ? "Apagar Linterna" : "Linterna LED";
+  }
+
+  async function toggleSpotlight() {
+    vibrate(14);
+    if (!BASE) await resolveLatestTunnel();
+    if (!BASE) return;
+    if (activeIsCloud) {
+      toast("La linterna física requiere tu Mac encendida", 2200);
+      return;
+    }
+    spotlightBtn.disabled = true;
+    spotlightToolBtn.disabled = true;
+    try {
+      const res = await fetch(`${BASE}/api/spotlight?t=${encodeURIComponent(T)}&state=toggle`, { method: "POST" });
+      const data = await res.json();
+      if (data.ok) {
+        renderSpotlight(Boolean(data.isSpotlightOn));
+        toast(data.isSpotlightOn ? "Linterna LED encendida (100%)" : "Linterna LED apagada", 1600);
+      } else {
+        toast("No se pudo controlar la linterna", 1600);
+      }
+    } catch (_) {
+      toast("Error al controlar la linterna", 1600);
+    } finally {
+      spotlightBtn.disabled = false;
+      spotlightToolBtn.disabled = false;
+    }
+  }
+  spotlightBtn.addEventListener("click", toggleSpotlight);
+  spotlightToolBtn.addEventListener("click", toggleSpotlight);
 
   document.querySelectorAll("[data-siren]").forEach((btn) => {
     btn.addEventListener("click", async () => {
